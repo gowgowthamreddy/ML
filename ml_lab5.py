@@ -2,188 +2,248 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings("ignore")
-
 import mne
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.metrics import (
-    mean_squared_error, r2_score,
-    silhouette_score, calinski_harabasz_score, davies_bouldin_score
+    confusion_matrix, precision_score, recall_score, f1_score,
+    mean_squared_error, r2_score
 )
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 
 
 # =====================================================
-# Utility Functions
+# A1: Sleep Stage Classification (N2 vs REM) with kNN
 # =====================================================
 
-def find_channel_name(raw, candidates=None):
-    if candidates is None:
-        candidates = ['Fpz-Cz', 'EEG Fpz-Cz', 'EEG Fpz-Cz (referential)',
-                      'Fpz-Cz (Cz)', 'FpzCz']
-    for c in candidates:
-        if c in raw.info['ch_names']:
-            return c
-    for ch in raw.info['ch_names']:
-        if 'fpz' in ch.lower():
-            return ch
-    for ch in raw.info['ch_names']:
-        if 'eeg' in ch.lower():
-            return ch
-    return None
+def load_sleep_data(psg_file, hyp_file, target_channels=['EEG Fpz-Cz']):
+    raw = mne.io.read_raw_edf(psg_file, preload=True, stim_channel=None)
+    annotations = mne.read_annotations(hyp_file)
+    raw.set_annotations(annotations)
+    raw.pick_channels(target_channels)
+    return raw
 
 
-def load_and_extract_features(psg_file, hyp_file, epoch_sec=30, verbose=True):
-    if not os.path.exists(psg_file) or not os.path.exists(hyp_file):
-        raise FileNotFoundError("EDF PSG or Hypnogram file not found.")
-
-    if verbose: print("Loading PSG:", psg_file)
-    raw = mne.io.read_raw_edf(psg_file, preload=True, stim_channel=None, verbose='ERROR')
-    ann = mne.read_annotations(hyp_file)
-    raw.set_annotations(ann)
-
-    ch = find_channel_name(raw)
-    if not ch:
-        raise ValueError("No suitable EEG channel found (e.g., Fpz-Cz).")
-    if verbose: print("Selected channel:", ch)
-
-    raw_pick = raw.copy().pick_channels([ch])
-    sfreq = raw_pick.info['sfreq']
-    signal = raw_pick.get_data()[0]
-
+def extract_features(raw):
     mapping = {
-        "Sleep stage W": 0, "Sleep stage 1": 1, "Sleep stage 2": 2,
-        "Sleep stage 3": 3, "Sleep stage 4": 3, "Sleep stage R": 4,
-        "W": 0, "1": 1, "2": 2, "3": 3, "4": 3, "R": 4,
-        "Wake": 0, "Sleep stage ?": -1
+        "Sleep stage W": 0,
+        "Sleep stage 1": 1,
+        "Sleep stage 2": 2,
+        "Sleep stage 3": 3,
+        "Sleep stage 4": 3,
+        "Sleep stage R": 4
     }
 
-    feats, labels, descs = [], [], []
-    for a in raw.annotations:
-        desc = a['description']
-        onset, dur = int(a['onset'] * sfreq), int(epoch_sec * sfreq)
-        end = onset + dur
-        if end > len(signal): continue
+    sfreq = int(raw.info['sfreq'])
+    signal = raw.get_data()[0]
+    epochs, labels = [], []
 
-        label = mapping.get(desc, -1)
-        if label == -1 and desc.isdigit():
-            label = int(desc)
-
-        seg = signal[onset:end]
-        feats.append([np.mean(seg), np.std(seg), np.min(seg), np.max(seg),
-                      np.percentile(seg, 25), np.percentile(seg, 75)])
-        labels.append(label)
-        descs.append(desc)
-
-    df = pd.DataFrame(feats, columns=['feat_mean','feat_std','feat_min','feat_max','feat_p25','feat_p75'])
-    df['stage'] = labels
-    df['stage_str'] = descs
-    if verbose: print(f"Extracted {len(df)} epochs, features = {df.shape[1]-2}")
-    return df
+    for ann in raw.annotations:
+        onset = int(ann['onset'] * sfreq)
+        label = mapping.get(ann['description'], -1)
+        if label in [2, 4]:  # N2 and REM
+            segment = signal[onset:onset + 30 * sfreq]
+            if len(segment) == 30 * sfreq:
+                features = [
+                    np.mean(segment), np.std(segment),
+                    np.min(segment), np.max(segment),
+                    np.percentile(segment, 25), np.percentile(segment, 75)
+                ]
+                epochs.append(features)
+                labels.append(0 if label == 2 else 1)
+    return np.array(epochs), np.array(labels)
 
 
-def print_regression_metrics(y_train, y_train_pred, y_test, y_test_pred):
-    def mape(y_true, y_pred):
-        return np.mean(np.abs((y_true - y_pred) / (np.where(y_true==0, 1e-8, y_true)))) * 100
-    print("Train -> MSE:", mean_squared_error(y_train, y_train_pred),
-          "RMSE:", np.sqrt(mean_squared_error(y_train, y_train_pred)),
-          "MAPE:", mape(y_train, y_train_pred),
-          "R2:", r2_score(y_train, y_train_pred))
-    print("Test  -> MSE:", mean_squared_error(y_test, y_test_pred),
-          "RMSE:", np.sqrt(mean_squared_error(y_test, y_test_pred)),
-          "MAPE:", mape(y_test, y_test_pred),
-          "R2:", r2_score(y_test, y_test_pred))
+def train_knn_classifier(X, y, k=3):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42
+    )
+    model = KNeighborsClassifier(n_neighbors=k)
+    model.fit(X_train, y_train)
+    return model, X_train, X_test, y_train, y_test
 
 
-# =====================================================
-# Regression Tasks (A1, A2, A3)
-# =====================================================
+def evaluate_classifier(y_train, y_test, y_train_pred, y_test_pred):
+    def report(name, y_true, y_pred):
+        print(f"{name} Performance:")
+        print("Confusion Matrix:\n", confusion_matrix(y_true, y_pred))
+        print(f"Precision: {precision_score(y_true, y_pred):.3f}")
+        print(f"Recall: {recall_score(y_true, y_pred):.3f}")
+        print(f"F1 Score: {f1_score(y_true, y_pred):.3f}\n")
 
-def single_attribute_regression(train_df, test_df):
-    print("\n=== A1: Linear Regression (Single Attribute) ===")
-    X_train, y_train = train_df[['f1']].values, train_df['target_mean'].values
-    X_test, y_test = test_df[['f1']].values, test_df['target_mean'].values
-    reg = LinearRegression().fit(X_train, y_train)
-    print_regression_metrics(y_train, reg.predict(X_train), y_test, reg.predict(X_test))
-
-
-def multi_attribute_regression(train_df, test_df):
-    print("\n=== A3: Linear Regression (Multi-Attribute) ===")
-    X_train, y_train = train_df[['f0','f1','f2','f3','f4','f5']], train_df['target_mean']
-    X_test, y_test = test_df[['f0','f1','f2','f3','f4','f5']], test_df['target_mean']
-    reg = LinearRegression().fit(X_train, y_train)
-    print_regression_metrics(y_train, reg.predict(X_train), y_test, reg.predict(X_test))
+    report("Training Set", y_train, y_train_pred)
+    report("Testing Set", y_test, y_test_pred)
 
 
 # =====================================================
-# Clustering Tasks (A4–A7)
+# A2: Purchase Data Regression with kNN
 # =====================================================
 
-def baseline_kmeans(X, k=2):
-    print(f"\n=== A4: Baseline KMeans (k={k}) ===")
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(X)
-    labels = kmeans.labels_
-    print("Cluster centers (scaled):\n", kmeans.cluster_centers_)
-    print(f"Silhouette: {silhouette_score(X, labels):.4f}, "
-          f"CH: {calinski_harabasz_score(X, labels):.4f}, "
-          f"DB: {davies_bouldin_score(X, labels):.4f}")
-    return kmeans
+def read_purchase_data(path):
+    return pd.read_excel(path, sheet_name='Purchase_data')
 
 
-def evaluate_kmeans_range(X, ks=range(2,13)):
-    print("\n=== A6: KMeans Evaluation (k=2..12) ===")
-    sil, ch, db, inertias = [], [], [], []
+def split_and_train_regressor(df, k=3):
+    features = df[['Candies (#)', 'Mangoes (Kg)', 'Milk Packets (#)']]
+    labels = df['Payment (Rs)']
 
-    for k in ks:
-        km = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(X)
-        labs = km.labels_
-        sil.append(silhouette_score(X, labs))
-        ch.append(calinski_harabasz_score(X, labs))
-        db.append(davies_bouldin_score(X, labs))
-        inertias.append(km.inertia_)
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, labels, test_size=0.2, random_state=42
+    )
 
-    # Plots
-    plt.figure(figsize=(14,4))
-    plt.subplot(1,3,1); plt.plot(ks, sil, marker='o'); plt.title("Silhouette vs k")
-    plt.subplot(1,3,2); plt.plot(ks, ch, marker='o'); plt.title("CH vs k")
-    plt.subplot(1,3,3); plt.plot(ks, db, marker='o'); plt.title("DB vs k")
-    plt.tight_layout(); plt.show()
+    model = KNeighborsRegressor(n_neighbors=k)
+    model.fit(X_train, y_train)
+    return model, X_train, X_test, y_train, y_test
 
-    plt.figure(); plt.plot(ks, inertias, marker='o'); plt.title("Elbow Plot")
-    plt.xlabel("k"); plt.ylabel("Inertia"); plt.grid(True); plt.show()
 
-    print("Best k (Silhouette):", ks[np.argmax(sil)])
-    print("Best k (CH):", ks[np.argmax(ch)])
-    print("Best k (DB):", ks[np.argmin(db)])
-    return inertias
+def evaluate_regressor(y_test, y_test_pred):
+    mse = mean_squared_error(y_test, y_test_pred)
+    rmse = np.sqrt(mse)
+    mape = np.mean(np.abs((y_test - y_test_pred) / (y_test + 1e-8))) * 100
+    r2 = r2_score(y_test, y_test_pred)
+
+    print(f"Mean Squared Error (MSE): {mse:.4f}")
+    print(f"Root Mean Squared Error (RMSE): {rmse:.4f}")
+    print(f"Mean Absolute Percentage Error (MAPE): {mape:.4f}")
+    print(f"R-squared (R2) Score: {r2:.4f}")
 
 
 # =====================================================
-# === DRIVER CODE ===
+# A3: Generate Synthetic Data
+# =====================================================
+
+def generate_synthetic_data(num_points=20, seed=42):
+    np.random.seed(seed)
+    X = np.random.uniform(1, 10, num_points)
+    Y = np.random.uniform(1, 10, num_points)
+    classes = np.where(X + Y > 11, 'class1 - Red', 'class0 - Blue')
+    data = pd.DataFrame({'X': X, 'Y': Y, 'Class': classes})
+    return data
+
+
+def plot_data(data):
+    plt.figure(figsize=(8, 6))
+    colors = {'class0 - Blue': 'blue', 'class1 - Red': 'red'}
+    plt.scatter(data['X'], data['Y'], c=data['Class'].map(colors))
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title('Scatter Plot of Training Data by Class')
+    plt.grid(True)
+    plt.show()
+    return data
+
+
+# =====================================================
+# A4–A5: kNN Decision Boundaries
+# =====================================================
+
+def plot_knn_decision_boundary(data, k=3, step=0.1):
+    x_min, x_max, y_min, y_max = 0, 10, 0, 10
+    xx, yy = np.meshgrid(
+        np.arange(x_min, x_max, step),
+        np.arange(y_min, y_max, step)
+    )
+    test_points = np.c_[xx.ravel(), yy.ravel()]
+    X_train = data[['X', 'Y']]
+    y_train = data['Class']
+
+    knn = KNeighborsClassifier(n_neighbors=k)
+    knn.fit(X_train, y_train)
+
+    Z = knn.predict(test_points)
+    test_data = pd.DataFrame({
+        'X': test_points[:, 0],
+        'Y': test_points[:, 1],
+        'Predicted_Class': Z
+    })
+
+    plt.figure(figsize=(10, 8))
+    colors = {'class0 - Blue': 'blue', 'class1 - Red': 'red'}
+    plt.scatter(test_data['X'], test_data['Y'],
+                c=test_data['Predicted_Class'].map(colors), s=5, alpha=0.5)
+    plt.scatter(data['X'], data['Y'], c=data['Class'].map(colors),
+                edgecolors='k', s=50, label='Training Points')
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title(f'kNN (k={k}) Decision Boundary')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+# =====================================================
+# A6: Analyze kNN Performance for Different k
+# =====================================================
+
+def analyze_knn_performance(X_train, y_train, X_test, y_test, k_values):
+    train_f1, test_f1 = [], []
+
+    for k in k_values:
+        knn = KNeighborsClassifier(n_neighbors=k)
+        knn.fit(X_train, y_train)
+
+        f1_train = f1_score(y_train, knn.predict(X_train))
+        f1_test = f1_score(y_test, knn.predict(X_test))
+
+        train_f1.append(f1_train)
+        test_f1.append(f1_test)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(k_values, train_f1, marker='o', label='Train F1 Score')
+    plt.plot(k_values, test_f1, marker='s', label='Test F1 Score')
+    plt.xlabel("Number of Neighbors (k)")
+    plt.ylabel("F1 Score")
+    plt.title("kNN Performance vs. Value of k (N2 vs REM)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+# =====================================================
+# A7: Grid Search for Best k
+# =====================================================
+
+def tune_knn_hyperparameters(X, y, max_k=20):
+    param_grid = {'n_neighbors': np.arange(1, max_k + 1)}
+    knn = KNeighborsClassifier()
+    grid_search = GridSearchCV(knn, param_grid, cv=5, scoring='accuracy')
+    grid_search.fit(X, y)
+    print(f"Best k value: {grid_search.best_params_['n_neighbors']}")
+    print(f"Best cross-validation accuracy: {grid_search.best_score_:.4f}")
+    print(f"Best kNN model: {grid_search.best_estimator_}")
+    return grid_search.best_estimator_
+
+
+# =====================================================
+# === DRIVER CODE (Run everything as before) ===
 # =====================================================
 
 if _name_ == "_main_":
-    psg_file = r"C:\Users\asus\Downloads\sleep-edf-database-expanded-1.0.0\sleep-edf-database-expanded-1.0.0\sleep-cassette\SC4012E0-PSG.edf"
-    hyp_file = r"C:\Users\asus\Downloads\sleep-edf-database-expanded-1.0.0\sleep-edf-database-expanded-1.0.0\sleep-cassette\SC4012EC-Hypnogram.edf"
+    # --- A1 ---
+    psg_file = r'C:\Users\asus\Downloads\sleep-edf-database-expanded-1.0.0\sleep-edf-database-expanded-1.0.0\sleep-cassette\SC4012E0-PSG.edf'
+    hyp_file = r'C:\Users\asus\Downloads\sleep-edf-database-expanded-1.0.0\sleep-edf-database-expanded-1.0.0\sleep-cassette\SC4012EC-Hypnogram.edf'
+    raw = load_sleep_data(psg_file, hyp_file)
+    X, y = extract_features(raw)
+    model, X_train, X_test, y_train, y_test = train_knn_classifier(X, y)
+    evaluate_classifier(y_train, y_test,
+                        model.predict(X_train), model.predict(X_test))
 
-    df = load_and_extract_features(psg_file, hyp_file, epoch_sec=30, verbose=True)
-    df = df[df['stage'] != -1].reset_index(drop=True)
+    # --- A2 ---
+    path1 = "/content/LabSessionData.xlsx"
+    df1 = read_purchase_data(path1)
+    reg_model, X_train1, X_test1, y_train1, y_test1 = split_and_train_regressor(df1)
+    y_test_pred1 = reg_model.predict(X_test1)
+    evaluate_regressor(y_test1, y_test_pred1)
 
-    # Standardize
-    X = StandardScaler().fit_transform(df[['feat_mean','feat_std','feat_min','feat_max','feat_p25','feat_p75']])
-    df_feats = pd.DataFrame(X, columns=['f0','f1','f2','f3','f4','f5'])
-    df_feats['target_mean'] = df['feat_mean'].values
+    # --- A3 ---
+    data = generate_synthetic_data()
+    plot_data(data)
 
-    n_train = int(0.7*len(df_feats))
-    train_df, test_df = df_feats.iloc[:n_train], df_feats.iloc[n_train:]
+    # --- A4 & A5 ---
+    plot_knn_decision_boundary(data, k=3)
+    plot_knn_decision_boundary(data, k=1)  # change k to see differences
 
-    # Regression tasks
-    single_attribute_regression(train_df, test_df)
-    multi_attribute_regression(train_df, test_df)
+    # --- A6 ---
+    analyze_knn_performance(X_train, y_train, X_test, y_test, k_values=list(range(1, 16)))
 
-    # Clustering tasks
-    baseline_kmeans(X, k=2)
-    evaluate_kmeans_range(X)
+    # --- A7 ---
+    tune_knn_hyperparameters(X, y)
